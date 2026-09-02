@@ -75,9 +75,9 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 accurate, so here's what's actually on screen.)
 
 **Sidebar** — invoice language picker (English, Spanish, French, German, Tamil, Other), a
-🌙 dark-mode toggle that re-themes the whole page, live batch status as metric tiles (total,
-processed, success rate), and a "Clear all invoices" button that resets the session (invoices
-and chat history) once there's something to clear.
+🌙 dark-mode toggle (dark by default) that re-themes the whole page, live batch status as
+metric tiles (total, processed, success rate), and a "Clear all invoices" button that resets
+the session (invoices and chat history) once there's something to clear.
 
 **📄 Invoice Extraction** — drag-and-drop upload for one or many images/PDFs at once;
 multi-page PDFs get a page picker. A radio picks the extraction method: the default vision LLM,
@@ -96,9 +96,10 @@ the input are disabled with an explanatory message until at least one invoice ex
 a question never fires against empty context. A "Clear chat" button appears once there's a
 conversation to clear.
 
-**🚨 Fraud Detection** — one expandable card per invoice: extracted fields, a 0-100 risk
-score with a progress bar, a Low/Medium/High category, and the specific reasons behind the
-score (see [Fraud Scoring](#fraud-scoring) below).
+**🚨 Fraud Detection** — one expandable card per invoice: Vendor/Invoice Number/Date/Amount as
+metrics, a risk score progress bar, a Low/Medium/High risk level, a human-readable explanation
+list, and a "Generated assessment (JSON)" popover with the exact scoring output (see
+[Fraud Scoring](#fraud-scoring) below).
 
 **📊 Analytics** — Plotly charts (total-amount distribution, tax vs. subtotal, currency
 breakdown) plus the Isolation Forest anomaly table.
@@ -160,10 +161,24 @@ Key advantages:
 
 ##  Fraud Scoring
 
-`score_invoices()` (`analytics.py`) scores every invoice in a batch from 0-100, buckets it
-into a **Low** (<30) / **Medium** (30-59) / **High** (60+) risk category, and returns the
-specific reasons behind the number. Every reason maps to a check the function actually ran —
-nothing here is a label without a check behind it:
+`score_invoices()` (`analytics.py`) scores every invoice in a batch internally on a 0-100
+scale, then returns a normalized result per invoice shaped exactly as:
+
+```json
+{
+  "risk_level": "High",
+  "risk_score": 0.89,
+  "reasons": [
+    "Duplicate pattern detected: this invoice number appears more than once in the batch.",
+    "Possible image manipulation: Error Level Analysis found an uneven compression pattern across the image (score 22.4, threshold 15) - a whole-image heuristic signal, not proof of editing and not localized to a specific region."
+  ]
+}
+```
+
+`risk_level` buckets from the internal 0-100 score as **Low** (<30) / **Medium** (30-59) /
+**High** (60+); `risk_score` is that score divided by 100, rounded to 2 decimals. Every string
+in `reasons` maps to a check the function actually ran — nothing here is a label without a
+check behind it:
 
 | Signal | Weight | What it checks |
 |---|---|---|
@@ -173,10 +188,16 @@ nothing here is a label without a check behind it:
 | OCR inconsistency (arithmetic) | 15 | `subtotal + tax` doesn't match the extracted `total_amount` |
 | OCR inconsistency (confidence) | 15 | Average field-extraction confidence < 60% |
 | Statistical anomaly | 25 | Isolation Forest flags this invoice's amounts as an outlier vs. the rest of the batch (shares one model fit with the Analytics tab, so both agree) |
-| Image manipulation signature | 20 | Error Level Analysis (ELA) finds an uneven JPEG compression pattern |
+| Missing required field(s) | 20 | Any of `invoice_number`, `vendor_name`, `total_amount`, `invoice_date` is null |
+| Inconsistent date format | 10 | `invoice_date` doesn't match any of ~10 common date patterns tried |
+| Suspicious value | 10 | `total_amount` is zero/negative, or an exact multiple of 1,000 (a mild Benford's-law-style heuristic - real totals landing on an exact round thousand are less common than one with cents) |
+| Image manipulation | 20 | Error Level Analysis (ELA) finds an uneven JPEG compression pattern across the whole image - **not** localized to a region, see caveat below |
 
-Weights sum and cap at 100. These are hand-set heuristic weights, not fit on labeled fraud
-data — there isn't any in this repo — so treat the score as a triage signal, not a verdict.
+Weights sum and cap at 100 before the /100 normalization. These are hand-set heuristic
+weights, not fit on labeled fraud data — there isn't any in this repo — so treat the score as
+a triage signal, not a verdict. The **Fraud Detection** tab shows this exact JSON per invoice
+behind a "Generated assessment (JSON)" button, alongside the extracted Vendor / Invoice
+Number / Date / Amount and a human-readable explanation list.
 
 **On the image-manipulation signal specifically**: ELA re-saves the image at a known JPEG
 quality and measures how much it differs from the original; a region edited after the

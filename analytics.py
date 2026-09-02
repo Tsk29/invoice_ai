@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import numpy as np
+from datetime import datetime
 from io import BytesIO
 from PIL import Image, ImageChops
 from sklearn.ensemble import IsolationForest
@@ -121,6 +122,36 @@ def compute_ela_score(image_bytes: bytes, quality: int = 90) -> float | None:
     diff_array = np.asarray(diff, dtype=np.float32)
     return float(diff_array.std())
 
+# Common invoice date formats. If a date string matches none of these, it's
+# flagged as an inconsistent/unparseable format rather than silently ignored -
+# a genuinely malformed date is itself a mild red flag on a document that's
+# supposed to follow a standard layout.
+_DATE_FORMATS = (
+    "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m-%d-%Y",
+    "%B %d, %Y", "%d %B %Y", "%b %d, %Y", "%d %b %Y",
+    "%m/%d/%y", "%d/%m/%y",
+)
+
+def _is_parseable_date(value: str) -> bool:
+    for fmt in _DATE_FORMATS:
+        try:
+            datetime.strptime(value.strip(), fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+def _is_suspiciously_round(amount: float) -> bool:
+    """Flags totals like 1000.00, 5000.00, 10000.00 - real transaction totals
+    landing exactly on a round thousand are statistically less common than
+    ones with cents/odd amounts, a heuristic related to Benford's-law-style
+    checks used in real fraud triage. Deliberately conservative (>=1000 and
+    an exact multiple of 1000) to avoid flagging ordinary small round bills
+    like a $20.00 lunch receipt."""
+    return amount >= 1000 and amount % 1000 == 0
+
+REQUIRED_FIELDS = ("invoice_number", "vendor_name", "total_amount", "invoice_date")
+
 # Weight of each triggered signal toward the 0-100 fraud score, and the
 # score thresholds that bucket the total into a risk category. These are
 # hand-set heuristic weights (not fit on labeled fraud data - there isn't
@@ -133,6 +164,9 @@ FRAUD_SIGNAL_WEIGHTS = {
     "low_extraction_confidence": 15,
     "statistical_amount_anomaly": 25,
     "possible_image_manipulation": 20,
+    "missing_required_fields": 20,
+    "inconsistent_date_format": 10,
+    "suspicious_value": 10,
 }
 # Calibrated against .Dataset samples: native-JPEG photos scored 0.5-0.8,
 # PNG-sourced/rescanned invoices scored 4.5-5.3 just from format conversion
@@ -145,11 +179,14 @@ RISK_THRESHOLDS = (30, 60)  # < low, low-medium boundary, medium-high boundary
 
 def score_invoices(invoices, run_ela: bool = True) -> list[dict]:
     """Score every invoice in the batch for fraud risk. Returns a list of
-    dicts (same order as `invoices`) with: image_id, score (0-100),
-    risk_category ("Low"/"Medium"/"High"), and reasons (list of
-    human-readable strings for every signal that fired). Every reason maps
-    to something this function actually computed - nothing here is a label
-    without a check behind it."""
+    dicts (same order as `invoices`) shaped as:
+        {"image_id": ..., "risk_level": "Low"/"Medium"/"High",
+         "risk_score": 0.0-1.0, "reasons": [...]}
+    Every reason maps to something this function actually computed - nothing
+    here is a label without a check behind it. In particular, the image-
+    manipulation reason flags the *whole image* as having an uneven
+    compression pattern (see compute_ela_score) - it does not localize which
+    region was altered, so its wording deliberately doesn't claim that."""
     invoice_numbers = [inv["invoice"].invoice_number for inv in invoices if inv["invoice"].invoice_number]
     duplicate_numbers = {num for num in invoice_numbers if invoice_numbers.count(num) > 1}
     anomaly_flags = compute_anomaly_flags(invoices)
@@ -160,6 +197,22 @@ def score_invoices(invoices, run_ela: bool = True) -> list[dict]:
         confidence_scores = inv.get("confidence_scores") or {}
         reasons = []
         score = 0
+
+        missing_fields = [f for f in REQUIRED_FIELDS if getattr(invoice, f) is None]
+        if missing_fields:
+            reasons.append(f"Missing required field(s): {', '.join(missing_fields)}.")
+            score += FRAUD_SIGNAL_WEIGHTS["missing_required_fields"]
+
+        if invoice.invoice_date and not _is_parseable_date(invoice.invoice_date):
+            reasons.append(f"Inconsistent or unrecognized date format: '{invoice.invoice_date}'.")
+            score += FRAUD_SIGNAL_WEIGHTS["inconsistent_date_format"]
+
+        if invoice.total_amount is not None and invoice.total_amount <= 0:
+            reasons.append(f"Suspicious value: total amount is zero or negative ({invoice.total_amount:,.2f}).")
+            score += FRAUD_SIGNAL_WEIGHTS["suspicious_value"]
+        elif invoice.total_amount is not None and _is_suspiciously_round(invoice.total_amount):
+            reasons.append(f"Suspicious value: total amount is an unusually round figure ({invoice.total_amount:,.2f}).")
+            score += FRAUD_SIGNAL_WEIGHTS["suspicious_value"]
 
         if invoice.invoice_number in duplicate_numbers:
             reasons.append("Duplicate pattern detected: this invoice number appears more than once in the batch.")
@@ -196,20 +249,20 @@ def score_invoices(invoices, run_ela: bool = True) -> list[dict]:
             ela_score = compute_ela_score(inv["image_bytes"])
             if ela_score is not None and ela_score > ELA_MANIPULATION_THRESHOLD:
                 reasons.append(
-                    f"Image manipulation signature: Error Level Analysis found an uneven compression "
-                    f"pattern (score {ela_score:.1f}, threshold {ELA_MANIPULATION_THRESHOLD:.0f}) - "
-                    f"a heuristic signal, not proof of editing."
+                    f"Possible image manipulation: Error Level Analysis found an uneven compression "
+                    f"pattern across the image (score {ela_score:.1f}, threshold {ELA_MANIPULATION_THRESHOLD:.0f}) - "
+                    f"a whole-image heuristic signal, not proof of editing and not localized to a specific region."
                 )
                 score += FRAUD_SIGNAL_WEIGHTS["possible_image_manipulation"]
 
         score = min(score, 100)
         low_bound, high_bound = RISK_THRESHOLDS
-        risk_category = "Low" if score < low_bound else ("Medium" if score < high_bound else "High")
+        risk_level = "Low" if score < low_bound else ("Medium" if score < high_bound else "High")
 
         results.append({
             "image_id": inv["image_id"],
-            "score": score,
-            "risk_category": risk_category,
+            "risk_level": risk_level,
+            "risk_score": round(score / 100, 2),
             "reasons": reasons,
         })
     return results

@@ -244,7 +244,7 @@ RISK_COLORS = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}
 
 def render_fraud_detection(invoices):
     """Render one expandable card per invoice: extracted fields, fraud
-    score, risk category, and the specific reasons behind the score (each
+    score, risk level, and the specific reasons behind the score (each
     reason maps to a check score_invoices() actually ran - see analytics.py)."""
     if not invoices:
         st.warning("No invoices to analyze for fraud.")
@@ -253,33 +253,49 @@ def render_fraud_detection(invoices):
     scored = score_invoices(invoices)
     scored_by_id = {s["image_id"]: s for s in scored}
 
-    high_count = sum(1 for s in scored if s["risk_category"] == "High")
-    medium_count = sum(1 for s in scored if s["risk_category"] == "Medium")
+    high_count = sum(1 for s in scored if s["risk_level"] == "High")
+    medium_count = sum(1 for s in scored if s["risk_level"] == "Medium")
     if high_count or medium_count:
         st.warning(f"⚠️ {high_count} high-risk and {medium_count} medium-risk invoice(s) out of {len(invoices)}.")
     else:
         st.success(f"✅ No elevated-risk invoices out of {len(invoices)} scored.")
 
-    for inv in sorted(invoices, key=lambda i: -scored_by_id[i["image_id"]]["score"]):
+    for inv in sorted(invoices, key=lambda i: -scored_by_id[i["image_id"]]["risk_score"]):
         result = scored_by_id[inv["image_id"]]
         invoice = inv["invoice"]
-        badge = RISK_COLORS[result["risk_category"]]
-        label = f"{badge} {invoice.invoice_number or 'Unknown invoice'} — {result['risk_category']} risk (score {result['score']}/100)"
-        with st.expander(label, expanded=(result["risk_category"] == "High")):
+        badge = RISK_COLORS[result["risk_level"]]
+        label = f"{badge} {invoice.invoice_number or 'Unknown invoice'} — {result['risk_level']} risk (score {result['risk_score']:.2f})"
+        with st.expander(label, expanded=(result["risk_level"] == "High")):
             col1, col2 = st.columns([1, 1])
             with col1:
                 st.markdown("**Extracted fields**")
-                st.json({k: v for k, v in invoice.dict().items() if k != "line_items"})
+                field_cols = st.columns(2)
+                field_cols[0].metric("Vendor", invoice.vendor_name or "—")
+                field_cols[1].metric("Invoice Number", invoice.invoice_number or "—")
+                field_cols = st.columns(2)
+                field_cols[0].metric("Date", invoice.invoice_date or "—")
+                amount = invoice.total_amount
+                field_cols[1].metric("Amount", f"{amount:,.2f} {invoice.currency or ''}".strip() if amount is not None else "—")
+                # st.expander can't nest inside the outer expander this card
+                # is already in, so st.popover is used for these sub-views.
+                with st.popover("Full extracted data"):
+                    st.json({k: v for k, v in invoice.dict().items() if k != "line_items"})
             with col2:
                 st.markdown("**Risk score**")
-                st.progress(result["score"] / 100)
-                st.markdown(f"**Category:** {badge} {result['risk_category']}")
-                st.markdown("**Why it was flagged**")
+                st.progress(result["risk_score"])
+                st.markdown(f"**Risk level:** {badge} {result['risk_level']}")
+                st.markdown("**Explanation (why it was flagged)**")
                 if result["reasons"]:
                     for reason in result["reasons"]:
                         st.markdown(f"- {reason}")
                 else:
                     st.markdown("- No red flags detected.")
+                with st.popover("Generated assessment (JSON)"):
+                    st.json({
+                        "risk_level": result["risk_level"],
+                        "risk_score": result["risk_score"],
+                        "reasons": result["reasons"],
+                    })
 
 # Batch processing status
 def display_batch_status(invoices):
@@ -318,7 +334,7 @@ def enhanced_ui():
         ["English", "Spanish", "French", "German", "Tamil", "Other"],
         key="language_select"
     )
-    dark_mode = st.sidebar.toggle("🌙 Dark mode", key="dark_mode_toggle")
+    dark_mode = st.sidebar.toggle("🌙 Dark mode", value=True, key="dark_mode_toggle")
     theme = "Dark" if dark_mode else "Light"
 
     st.markdown(build_theme_css(theme), unsafe_allow_html=True)
