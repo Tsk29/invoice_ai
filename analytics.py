@@ -8,29 +8,53 @@ from PIL import Image, ImageChops
 from sklearn.ensemble import IsolationForest
 from utils import InvoiceData
 
+# Matches the dashboard's dark theme (enhanced_ui.py's build_theme_css) so
+# charts don't render with Plotly's light-mode default background against a
+# dark page.
+CHART_ACCENT = "#6c8ef5"
+CHART_TEMPLATE = "plotly_dark"
+
+def _themed(fig):
+    fig.update_layout(
+        template=CHART_TEMPLATE,
+        paper_bgcolor="#1b202b",
+        plot_bgcolor="#1b202b",
+        margin=dict(t=48, l=10, r=10, b=10),
+    )
+    return fig
+
 def analyze_invoices(invoices):
     """Display an analytics dashboard for processed invoices."""
     df = pd.DataFrame([inv["invoice"].dict() for inv in invoices])
-    
+
     # Total Amount Distribution
     if "total_amount" in df and df["total_amount"].notna().any():
         st.subheader("Total Amount Distribution")
-        fig = px.histogram(df, x="total_amount", nbins=20, title="Distribution of Total Amounts")
-        st.plotly_chart(fig, use_container_width=True)
-    
+        fig = px.histogram(
+            df, x="total_amount", nbins=20, title="Distribution of Total Amounts",
+            color_discrete_sequence=[CHART_ACCENT],
+        )
+        st.plotly_chart(_themed(fig), use_container_width=True)
+
     # Tax vs. Subtotal Scatter
     if "subtotal" in df and "tax" in df and df[["subtotal", "tax"]].notna().any().all():
         st.subheader("Tax vs. Subtotal")
-        fig = px.scatter(df, x="subtotal", y="tax", title="Tax vs. Subtotal", hover_data=["invoice_number"])
-        st.plotly_chart(fig, use_container_width=True)
-    
+        fig = px.scatter(
+            df, x="subtotal", y="tax", title="Tax vs. Subtotal", hover_data=["invoice_number"],
+            color_discrete_sequence=[CHART_ACCENT],
+        )
+        st.plotly_chart(_themed(fig), use_container_width=True)
+
     # Currency Breakdown
     if "currency" in df and df["currency"].notna().any():
         st.subheader("Currency Breakdown")
         currency_counts = df["currency"].value_counts().reset_index()
         currency_counts.columns = ["Currency", "Count"]
-        fig = px.pie(currency_counts, names="Currency", values="Count", title="Invoices by Currency")
-        st.plotly_chart(fig, use_container_width=True)
+        fig = px.pie(
+            currency_counts, names="Currency", values="Count", title="Invoices by Currency",
+            color_discrete_sequence=px.colors.sequential.Blues_r,
+        )
+        st.plotly_chart(_themed(fig), use_container_width=True)
 
 def compute_anomaly_flags(invoices, contamination: float = 0.15) -> dict:
     """Run Isolation Forest over the batch's numeric fields and return

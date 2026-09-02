@@ -129,6 +129,33 @@ def build_theme_css(theme: str) -> str:
         .low-confidence {{
             background-color: rgba(255, 99, 132, 0.2);
         }}
+        /* Streamlit's own top decoration bar, recolored to the app accent
+           instead of its default red, so the very first thing on screen
+           matches the rest of the theme rather than clashing with it. */
+        [data-testid="stDecoration"] {{
+            background-image: linear-gradient(90deg, {accent}, {accent}aa) !important;
+        }}
+        [data-testid="stMetric"] {{
+            background-color: {surface};
+            border: 1px solid {border};
+            border-radius: 10px;
+            padding: 0.75rem 1rem;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+        }}
+        [data-testid="stMetricLabel"] {{
+            color: {muted} !important;
+        }}
+        [data-testid="stMetricValue"] {{
+            font-weight: 700 !important;
+        }}
+        .st-expander, [data-testid="stExpander"], .stDataFrame {{
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+        }}
+        [data-testid="stSidebar"] h1 {{
+            border-bottom: 2px solid {accent};
+            padding-bottom: 0.6rem;
+            margin-bottom: 0.5rem;
+        }}
         </style>
     """
 
@@ -241,6 +268,7 @@ def extract_one_invoice(image_bytes: bytes, mime_type: str, language: str, api_k
 
 # Fraud detection
 RISK_COLORS = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}
+RISK_ACCENT_COLORS = {"Low": "#22c55e", "Medium": "#f59e0b", "High": "#ef4444"}
 
 def render_fraud_detection(invoices):
     """Render one expandable card per invoice: extracted fields, fraud
@@ -266,6 +294,11 @@ def render_fraud_detection(invoices):
         badge = RISK_COLORS[result["risk_level"]]
         label = f"{badge} {invoice.invoice_number or 'Unknown invoice'} — {result['risk_level']} risk (score {result['risk_score']:.2f})"
         with st.expander(label, expanded=(result["risk_level"] == "High")):
+            accent = RISK_ACCENT_COLORS[result["risk_level"]]
+            st.markdown(
+                f"<div style='height:4px;background:{accent};border-radius:2px;margin-bottom:14px'></div>",
+                unsafe_allow_html=True,
+            )
             col1, col2 = st.columns([1, 1])
             with col1:
                 st.markdown("**Extracted fields**")
@@ -334,8 +367,10 @@ def enhanced_ui():
         ["English", "Spanish", "French", "German", "Tamil", "Other"],
         key="language_select"
     )
-    dark_mode = st.sidebar.toggle("🌙 Dark mode", value=True, key="dark_mode_toggle")
-    theme = "Dark" if dark_mode else "Light"
+    # Dark mode is the only theme - no toggle. build_theme_css still takes a
+    # theme argument (kept for the Light branch's color values, in case a
+    # toggle comes back later) but "Dark" is now hardcoded, not user-chosen.
+    theme = "Dark"
 
     st.markdown(build_theme_css(theme), unsafe_allow_html=True)
 

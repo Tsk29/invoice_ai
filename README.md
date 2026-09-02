@@ -13,7 +13,7 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 - **PDF Support**: Upload PDF invoices directly — pages are rasterized and sent through the same extraction pipeline as images
 - **Explainable Fraud Scoring**: Every invoice gets a 0-100 score, a Low/Medium/High risk category, and a plain-language reason for every signal that fired - not just a flag with no explanation
 - **Anomaly Detection**: Real Isolation Forest (scikit-learn) over total/subtotal/tax to flag statistically unusual invoices
-- **Interactive UI**: Streamlit dashboard with a working light/dark mode toggle
+- **Interactive UI**: Dark-themed Streamlit dashboard with themed metric tiles, risk-level accent bars, and dark-mode Plotly charts (see [UI Design](#ui-design))
 - **Batch Processing**: Upload and process multiple invoices (images or PDFs) at once
 - **Data Export**: Export extracted invoices to CSV or JSON with one click
 - **Chat Assistant**: Ask natural-language questions about your processed invoices
@@ -71,13 +71,27 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 ##  Interface Tour
 
 `enhanced_ui.py` is the primary app — a single-page dashboard with a sidebar and four tabs.
-(There's no hosted screenshot here; the UI changes too often for a static image to stay
-accurate, so here's what's actually on screen.)
+Screenshots below are from the running app (dark theme, the only theme - see the Sidebar note);
+re-run `streamlit run enhanced_ui.py` and screenshot your own if you want to confirm the UI
+still looks like this - it's genuinely captured output, not a mockup, but a fast-moving UI can
+drift from any static image over time.
 
-**Sidebar** — invoice language picker (English, Spanish, French, German, Tamil, Other), a
-🌙 dark-mode toggle (dark by default) that re-themes the whole page, live batch status as
-metric tiles (total, processed, success rate), and a "Clear all invoices" button that resets
-the session (invoices and chat history) once there's something to clear.
+<table>
+<tr>
+<td width="50%"><img src="screenshots/extraction.jpg" alt="Invoice Extraction tab: uploaded invoice, extracted fields as metric tiles, and a line-items table"/><br/><sub><b>📄 Invoice Extraction</b> — metric tiles + line-items table</sub></td>
+<td width="50%"><img src="screenshots/chatbot.jpg" alt="Chatbot tab: a quick-question button click and the assistant's markdown-formatted summary response"/><br/><sub><b>🤖 Chatbot</b> — real chat thread with quick questions</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="screenshots/fraud_detection.jpg" alt="Fraud Detection tab: a scored invoice card with a green low-risk accent bar, extracted fields, and risk score"/><br/><sub><b>🚨 Fraud Detection</b> — risk-level accent bar + score</sub></td>
+<td width="50%"><img src="screenshots/analytics.jpg" alt="Analytics tab: a dark-themed Plotly histogram of total invoice amounts"/><br/><sub><b>📊 Analytics</b> — dark-themed Plotly charts</sub></td>
+</tr>
+</table>
+
+**Sidebar** — invoice language picker (English, Spanish, French, German, Tamil, Other), live
+batch status as metric tiles (total, processed, success rate), and a "Clear all invoices"
+button that resets the session (invoices and chat history) once there's something to clear.
+Dark mode is the only theme - there's no light/dark toggle; see [UI Design](#ui-design) below
+for why and what the theme system still looks like under the hood.
 
 **📄 Invoice Extraction** — drag-and-drop upload for one or many images/PDFs at once;
 multi-page PDFs get a page picker. A radio picks the extraction method: the default vision LLM,
@@ -106,6 +120,32 @@ breakdown) plus the Isolation Forest anomaly table.
 
 `app.py` is a second, lightweight entry point: single-invoice upload, extraction, inline
 editing, CSV/JSON export, and a basic chat box — no tabs, no batch processing.
+
+##  UI Design
+
+`enhanced_ui.py`'s theme (`build_theme_css()`) is dark-only - the earlier light/dark toggle
+was removed rather than kept as dead weight, since maintaining two palettes for a feature
+nobody was asked to keep isn't worth the CSS surface area. The theme function still takes a
+`theme` argument and both palettes' color values are still defined internally (so a toggle
+could come back cheaply if that ever changes), but the sidebar just doesn't expose it anymore.
+
+A few things beyond flat dark colors:
+- **Streamlit's own top decoration bar** is recolored to the app's accent color instead of
+  its default red, so the very first pixel on screen matches the rest of the theme.
+- **`st.metric` tiles** (batch status, extracted-field summaries) get a card treatment -
+  background, border, subtle shadow - instead of Streamlit's bare default styling.
+- **Risk-level accent bars**: each Fraud Detection card gets a thin colored bar (green/amber/
+  red) matching its risk level, rendered as a small inline `<div>` at the top of the card since
+  Streamlit doesn't expose enough hooks to theme individual `st.expander` instances differently
+  through CSS alone.
+- **Plotly charts** (`analytics.py`) explicitly set `template="plotly_dark"` and the app's
+  accent color - without this they render with Plotly's light-mode defaults regardless of the
+  page's own theme, which is what they did before this pass (visible as a jarring light-blue
+  chart floating on the dark page).
+- Cards, expanders, and dataframes all get a consistent `box-shadow` for depth, and the sidebar
+  title gets an accent-colored underline instead of sitting bare.
+
+See [Interface Tour](#interface-tour) above for what this actually looks like.
 
 ##  How It Works
 
