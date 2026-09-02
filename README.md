@@ -11,7 +11,7 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 - **Multilingual Support**: Parse invoices in English, Spanish, French, German, Tamil, and more
 - **AI-Powered Extraction**: Uses a Groq-hosted vision LLM for structured data extraction from images or PDFs
 - **PDF Support**: Upload PDF invoices directly — pages are rasterized and sent through the same extraction pipeline as images
-- **Fraud Detection**: Rules-based system flagging duplicate invoice numbers, unusually high totals, and disproportionate tax
+- **Explainable Fraud Scoring**: Every invoice gets a 0-100 score, a Low/Medium/High risk category, and a plain-language reason for every signal that fired - not just a flag with no explanation
 - **Anomaly Detection**: Real Isolation Forest (scikit-learn) over total/subtotal/tax to flag statistically unusual invoices
 - **Interactive UI**: Streamlit dashboard with a working light/dark mode toggle
 - **Batch Processing**: Upload and process multiple invoices (images or PDFs) at once
@@ -27,6 +27,7 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=streamlit)
 ![Groq](https://img.shields.io/badge/Groq-00A98F?logo=groq)
 ![PyMuPDF](https://img.shields.io/badge/PyMuPDF-PDF_Rendering-red)
+![Pillow](https://img.shields.io/badge/Pillow-ELA_%2F_Preprocessing-blueviolet)
 ![Isolation Forest](https://img.shields.io/badge/Isolation_Forest-scikit--learn-green?logo=scikitlearn)
 ![Pandas](https://img.shields.io/badge/Pandas-150458?logo=pandas)
 ![Plotly](https://img.shields.io/badge/Plotly-3F4F75?logo=plotly)
@@ -59,9 +60,10 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 
 4. **Core Modules**  
    ![Python Icon](https://img.icons8.com/color/48/000000/python.png)  
-   - `analytics.py`: ML-powered anomaly detection
-   - `app.py`: Main processing pipeline
-   - `enhanced_ui.py`: Interactive dashboard components
+   - `analytics.py`: Isolation Forest anomaly detection, explainable fraud scoring, ELA
+     image-manipulation heuristic, Plotly charts
+   - `app.py`: Lightweight single-invoice processing pipeline
+   - `enhanced_ui.py`: Full dashboard - batch extraction, chatbot, fraud detection, analytics
 
 ##  Interface Tour
 
@@ -81,7 +83,9 @@ cells highlighted), and direct "Download All as CSV / JSON" buttons.
 **🤖 Chatbot** — a real chat thread (`st.chat_message` bubbles) with four one-click quick
 questions plus free-text input, answering from the currently extracted invoice batch.
 
-**🚨 Fraud Detection** — a table of invoices flagged by the rule-based checks below.
+**🚨 Fraud Detection** — one expandable card per invoice: extracted fields, a 0-100 risk
+score with a progress bar, a Low/Medium/High category, and the specific reasons behind the
+score (see [Fraud Scoring](#fraud-scoring) below).
 
 **📊 Analytics** — Plotly charts (total-amount distribution, tax vs. subtotal, currency
 breakdown) plus the Isolation Forest anomaly table.
@@ -98,9 +102,21 @@ The extraction flow (used by both apps) is:
 1. **PDF Rasterization**: PDF uploads are rendered page-by-page to images (PyMuPDF) before extraction
 2. **Image Preprocessing**: Enhances contrast and resizes images for optimal OCR accuracy
 3. **Vision LLM Extraction**: A Groq-hosted vision model extracts structured data from the image
-4. **Type Detection**: Classifies invoices as retail, service, utility, or general
+4. **Type Detection**: Classifies invoices as retail, service, utility, or general - computed
+   from the same extraction call's result, not a separate model call
 5. **Confidence Scoring**: Provides confidence levels for each extracted field
 6. **Validation**: Cross-checks calculated totals against extracted values
+
+**Batch extraction speed**: `enhanced_ui.py`'s batch uploader used to make *two* full vision-LLM
+calls per image - one solely to classify invoice type (discarding everything except that
+label), then a second, nearly identical call that was the one actually kept. Type detection
+only needs fields the extraction call already returns (vendor name, line-item descriptions),
+so the second call was pure overhead. It's now one call per image, and the batch runs
+concurrently (`ThreadPoolExecutor`, capped at 4 workers) instead of one image at a time.
+Measured on a 4-image batch against the same model: ~230s before → ~140s after (~40% faster).
+The remaining time is dominated by the vision model's own per-call latency, not client-side
+inefficiency - see [OCR Architecture](#ocr-architecture-why-not-paddleocr-yet) below for why
+a local-OCR hybrid wasn't the next move.
 
 ### Anomaly Detection with Isolation Forest
 
@@ -129,16 +145,64 @@ Key advantages:
 - Identifies both global and local outliers
 - Computationally efficient
 
-### Fraud Detection System
+##  Fraud Scoring
 
-`detect_fraud()` (`enhanced_ui.py`) applies rule-based checks per batch:
+`score_invoices()` (`analytics.py`) scores every invoice in a batch from 0-100, buckets it
+into a **Low** (<30) / **Medium** (30-59) / **High** (60+) risk category, and returns the
+specific reasons behind the number. Every reason maps to a check the function actually ran —
+nothing here is a label without a check behind it:
 
-- Duplicate invoice numbers across different uploads
-- Unusually high total amount (> 100,000)
-- Tax disproportionate to total (> 30% of total amount)
+| Signal | Weight | What it checks |
+|---|---|---|
+| Duplicate pattern detected | 35 | Invoice number appears more than once in the batch |
+| Unusually high total | 20 | `total_amount` > 100,000 |
+| Disproportionate tax | 20 | `tax` > 30% of `total_amount` |
+| OCR inconsistency (arithmetic) | 15 | `subtotal + tax` doesn't match the extracted `total_amount` |
+| OCR inconsistency (confidence) | 15 | Average field-extraction confidence < 60% |
+| Statistical anomaly | 25 | Isolation Forest flags this invoice's amounts as an outlier vs. the rest of the batch (shares one model fit with the Analytics tab, so both agree) |
+| Image manipulation signature | 20 | Error Level Analysis (ELA) finds an uneven JPEG compression pattern |
 
-This runs independently from the Isolation Forest anomaly detection in the **Analytics**
-tab — fraud rules are deterministic thresholds, anomaly detection is statistical.
+Weights sum and cap at 100. These are hand-set heuristic weights, not fit on labeled fraud
+data — there isn't any in this repo — so treat the score as a triage signal, not a verdict.
+
+**On the image-manipulation signal specifically**: ELA re-saves the image at a known JPEG
+quality and measures how much it differs from the original; a region edited after the
+original compression tends to show a different error level than the rest of the image. It's
+a real, if weak, forensics heuristic — calibrated here against `.Dataset` samples, where
+native-JPEG photos scored 0.5-0.8 and PNG-sourced/rescanned invoices scored 4.5-5.3 from
+format-conversion noise alone, with no tampering involved. The threshold (15.0) sits above
+that clean baseline to avoid flagging ordinary format differences, which also means it will
+miss anything but fairly aggressive edits. A synthetic tamper test (pasting text into a
+sample invoice) barely moved the score. Treat this as a weak supplementary signal, not a
+manipulation detector.
+
+##  OCR Architecture: why not PaddleOCR (yet)
+
+The extraction pipeline sends the whole invoice image straight to a Groq-hosted vision LLM,
+which reads and structures it in one pass — there's no local OCR step today. A local-OCR +
+text-LLM hybrid (PaddleOCR extracts raw text fast and cheaply; a text-only LLM call structures
+it, skipping the much more expensive vision-token processing) is a real, legitimate pattern
+and was evaluated for this repo. It wasn't adopted, for three concrete reasons:
+
+1. **Footprint**: `paddlepaddle` alone is a ~100MB wheel on macOS ARM (~186MB on Linux), plus
+   `paddleocr` and its downloaded recognition/detection models on top — a large jump for an
+   app whose entire dependency list is currently a few hundred KB of pure-Python packages, and
+   a real concern for anyone deploying this on a resource-capped host (e.g. Streamlit
+   Community Cloud).
+2. **Tamil support is uncertain**: this repo's actual multilingual pain point is Tamil (see
+   [Multilingual Support](#multilingual-support)), and PaddleOCR's multilingual recognition
+   quality outside its strongest languages (Chinese, English) wasn't verified against a Tamil
+   sample before deciding — that verification would need to happen before committing to the
+   dependency, not after.
+3. **The measured bottleneck wasn't OCR** — it was calling the vision LLM twice per image (see
+   above). Fixing that (one call instead of two, run concurrently) cut batch time by ~40% with
+   zero new dependencies and zero architecture risk, which is a better cost/benefit trade than
+   a rearchitecture whose main promised benefit is *also* speed.
+
+If someone wants to revisit this: the right next step is a spike that runs `paddleocr` against
+the Tamil sample in `.Dataset/` and compares its raw text output to what the vision model
+already extracts, *before* touching the pipeline - the decision should follow evidence on this
+repo's actual documents, not general reputation.
 
 ##  Installation
 
@@ -199,7 +263,7 @@ The **Analytics** tab (`analyze_invoices()` in `analytics.py`) charts the curren
 - Isolation Forest anomaly flags (see above)
 
 Temporal trend analysis, vendor spend rollups, and cash-flow forecasting aren't implemented
-yet — see [Future Enhancements](#-future-enhancements).
+yet — see [Future Enhancements](#future-enhancements).
 
 ##  Multilingual Support
 
@@ -216,25 +280,18 @@ subtotal + tax, which fixed a real mismatch we hit on a sample Tamil invoice, bu
 an LLM accuracy limitation, not a solved problem. Always spot-check extracted numeric fields
 against the source document.
 
-##  Fraud Detection Rules
-
-Implemented today, in `detect_fraud()`:
-
-1. **Duplicate Invoice Numbers**: Same invoice number appears more than once in a batch
-2. **Unusually High Total**: Total amount exceeds 100,000
-3. **Amount Discrepancies**: Tax exceeds 30% of the total amount
-
-Round-amount detection, after-hours invoice flags, and rapid-succession-from-same-vendor
-checks are not implemented yet — tracked in [Future Enhancements](#-future-enhancements).
-
 ##  Future Enhancements
 
 - [ ] **Persistence** — invoices currently live only in `st.session_state` and vanish on
       reload; add a SQLite/Postgres store so extracted history survives across sessions
 - [ ] **Multi-page PDF extraction** — currently one page per PDF is extracted; merge line
       items across all pages of a multi-page invoice
-- [ ] **OCR fallback** — fall back to Tesseract for low-confidence or low-quality scans
-      instead of relying solely on the vision LLM
+- [ ] **PaddleOCR spike** — run it against the Tamil samples in `.Dataset/` and compare
+      against the vision model's own output before deciding whether to adopt it (see
+      [OCR Architecture](#ocr-architecture-why-not-paddleocr-yet))
+- [ ] **Fraud score calibration** — the signal weights and ELA threshold are hand-set
+      heuristics; calibrating them against real labeled fraud examples (if any become
+      available) would make the score meaningfully more trustworthy
 - [ ] Additional fraud rules: round-amount detection, after-hours invoice dates,
       rapid-succession invoices from the same vendor
 - [ ] Vendor reputation scoring system
@@ -243,6 +300,8 @@ checks are not implemented yet — tracked in [Future Enhancements](#-future-enh
 - [ ] Email ingestion (forward invoices to a monitored inbox for auto-processing)
 - [ ] Predictive analytics for payment delays
 - [ ] Mobile app with camera integration
+- [ ] Automated benchmark harness (planted-defect scoring against ground truth) so extraction
+      accuracy claims can be backed by a number instead of asserted
 
 ## 🤝 Contributing
 

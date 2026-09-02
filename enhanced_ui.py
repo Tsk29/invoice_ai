@@ -3,8 +3,9 @@ import json
 import base64
 import pandas as pd
 from utils import InvoiceData, GroqClient, preprocess_image, process_image_upload, process_image_url, display_image_preview, setup_page, show_extraction_button, display_results, display_error, run_chatbot, edit_invoice_data, export_to_csv, is_pdf_file, get_pdf_page_count, render_pdf_page
-from analytics import analyze_invoices, detect_anomalies
+from analytics import analyze_invoices, detect_anomalies, score_invoices
 from uuid import uuid4
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 
 # ---------------------------
@@ -29,6 +30,28 @@ def build_theme_css(theme: str) -> str:
             background-color: {bg};
         }}
         .stApp, .stApp p, .stApp span, .stApp label, .stMarkdown, h1, h2, h3, h4 {{
+            color: {text} !important;
+        }}
+        /* Streamlit's own toolbar and file-uploader dropzone keep a fixed dark
+           background regardless of app theme - the blanket span/p/label rule
+           above overrides their text to the app's (light-mode) dark color,
+           making them unreadable dark-on-dark. Force them back to light text.
+           (`.stApp` prefix is required so this out-specifies the `.stApp span`
+           rule above - a bare `[data-testid=...] *` selector loses that fight.) */
+        .stApp [data-testid="stHeader"], .stApp [data-testid="stHeader"] span,
+        .stApp [data-testid="stFileUploaderDropzone"],
+        .stApp [data-testid="stFileUploaderDropzone"] span,
+        .stApp [data-testid="stFileUploaderDropzone"] div,
+        .stApp [data-testid="stFileUploaderDropzone"] small {{
+            color: #fafafa !important;
+        }}
+        /* The selectbox's selected-value text sits in a nested div whose
+           background BaseWeb's own generated utility classes control - those
+           compound multi-class selectors out-specificity a plain override,
+           so the :not(#_):not(#_) chain is a standard CSS trick to force
+           higher specificity without hardcoding fragile auto-generated class
+           names, so the text color reliably follows the current theme here too. */
+        [data-testid="stSelectbox"] [data-baseweb="select"] > div > div > div:not(#_):not(#_) {{
             color: {text} !important;
         }}
         .block-container {{
@@ -127,40 +150,114 @@ def detect_invoice_type(invoice_data: dict) -> str:
             return inv_type
     return "general"
 
+EXTRACTION_PROMPT_TEMPLATE = """
+You are an intelligent OCR extraction agent capable of understanding and processing invoices in {language}.
+Extract all relevant information from the provided invoice image in structured JSON format.
+The JSON object must follow this schema: {schema}.
+Include a confidence score (0.0 to 1.0) for each extracted field in a separate 'confidence_scores' object.
+If a field cannot be found, return it as null.
+Look for common invoice patterns such as:
+- Invoice number: Often labeled as 'Invoice #', 'No.', or similar.
+- Dates: Look for 'Date', 'Issued', 'Due', in formats like MM/DD/YYYY or DD/MM/YYYY.
+- Addresses: Look for 'Bill to', 'Ship to', or multi-line address blocks.
+- Line items: Tables or lists with description, quantity, unit price, and total.
+- Totals: Look for 'Subtotal', 'Tax', 'Total', often at the bottom.
+- Currency: Look for symbols ($, €, £) or codes (USD, EUR).
+IMPORTANT: total_amount must be the literal total figure printed on
+the invoice, not a value you compute by adding subtotal and tax
+yourself - if the printed total looks inconsistent with subtotal +
+tax, still report the printed value verbatim; that inconsistency is
+a real finding, not a fix for you to make.
+Return the result strictly in JSON format with 'data' and 'confidence_scores' keys.
+"""
+
+def extract_one_invoice(image_bytes: bytes, mime_type: str, language: str, api_key: str, max_retries: int = 2):
+    """Run one image through extraction and return (record, error). Runs
+    inside a worker thread as part of the batch's concurrent processing, so
+    it must never call any st.* function - Streamlit's session context isn't
+    available off the main script thread. UI rendering happens afterward,
+    back on the main thread, using the record this returns.
+
+    This used to be two full vision-LLM calls per image: one purely to
+    classify the invoice type, then a second, nearly identical call that was
+    the one actually used. The type classification only needs the fields the
+    single call below already extracts (vendor name, line-item descriptions),
+    so the second call was pure overhead - cutting it roughly halves
+    per-image latency.
+    """
+    groq_client = GroqClient(api_key=api_key)
+    prompt = EXTRACTION_PROMPT_TEMPLATE.format(
+        language=language,
+        schema=json.dumps(InvoiceData.model_json_schema(), indent=2)
+    )
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    image_content = {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}
+    }
+
+    last_error = "No data extracted"
+    for _ in range(max_retries):
+        try:
+            extracted_data = groq_client.extract_invoice_data(prompt, image_content)
+            data = extracted_data.get("data", {})
+            if all(value is None for value in data.values()):
+                last_error = "Model returned no data"
+                continue
+            invoice = InvoiceData(**data)
+            record = {
+                "invoice": invoice,
+                "confidence_scores": extracted_data.get("confidence_scores", {}),
+                "image_id": str(uuid4()),
+                "invoice_type": detect_invoice_type(data),
+                "image_bytes": image_bytes,
+            }
+            return record, None
+        except Exception as e:
+            last_error = str(e)
+    return None, last_error
+
 # Fraud detection
-def detect_fraud(invoices):
-    """Detect potential fraud in invoices using rules."""
+RISK_COLORS = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}
+
+def render_fraud_detection(invoices):
+    """Render one expandable card per invoice: extracted fields, fraud
+    score, risk category, and the specific reasons behind the score (each
+    reason maps to a check score_invoices() actually ran - see analytics.py)."""
     if not invoices:
         st.warning("No invoices to analyze for fraud.")
         return
-    
-    fraud_data = []
-    invoice_numbers = [inv["invoice"].invoice_number for inv in invoices if inv["invoice"].invoice_number]
-    duplicates = {num for num in invoice_numbers if invoice_numbers.count(num) > 1}
-    
-    for inv in invoices:
-        invoice = inv["invoice"]
-        flags = []
-        if invoice.invoice_number in duplicates:
-            flags.append("Duplicate invoice number detected.")
-        if invoice.total_amount and invoice.total_amount > 100000:
-            flags.append("Unusually high total amount.")
-        if invoice.tax and invoice.total_amount and invoice.tax > 0.3 * invoice.total_amount:
-            flags.append("Unusually high tax amount.")
-        if flags:
-            fraud_data.append({
-                "Invoice ID": inv["image_id"],
-                "Invoice Number": invoice.invoice_number,
-                "Total Amount": invoice.total_amount,
-                "Tax": invoice.tax,
-                "Flags": "; ".join(flags)
-            })
-    
-    if fraud_data:
-        st.subheader("Potential Fraud Alerts")
-        st.dataframe(pd.DataFrame(fraud_data))
+
+    scored = score_invoices(invoices)
+    scored_by_id = {s["image_id"]: s for s in scored}
+
+    high_count = sum(1 for s in scored if s["risk_category"] == "High")
+    medium_count = sum(1 for s in scored if s["risk_category"] == "Medium")
+    if high_count or medium_count:
+        st.warning(f"⚠️ {high_count} high-risk and {medium_count} medium-risk invoice(s) out of {len(invoices)}.")
     else:
-        st.success("No potential fraud detected.")
+        st.success(f"✅ No elevated-risk invoices out of {len(invoices)} scored.")
+
+    for inv in sorted(invoices, key=lambda i: -scored_by_id[i["image_id"]]["score"]):
+        result = scored_by_id[inv["image_id"]]
+        invoice = inv["invoice"]
+        badge = RISK_COLORS[result["risk_category"]]
+        label = f"{badge} {invoice.invoice_number or 'Unknown invoice'} — {result['risk_category']} risk (score {result['score']}/100)"
+        with st.expander(label, expanded=(result["risk_category"] == "High")):
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.markdown("**Extracted fields**")
+                st.json({k: v for k, v in invoice.dict().items() if k != "line_items"})
+            with col2:
+                st.markdown("**Risk score**")
+                st.progress(result["score"] / 100)
+                st.markdown(f"**Category:** {badge} {result['risk_category']}")
+                st.markdown("**Why it was flagged**")
+                if result["reasons"]:
+                    for reason in result["reasons"]:
+                        st.markdown(f"- {reason}")
+                else:
+                    st.markdown("- No red flags detected.")
 
 # Batch processing status
 def display_batch_status(invoices):
@@ -299,93 +396,36 @@ def enhanced_ui():
                 st.subheader("Extracted Invoice Data")
                 if show_extraction_button():
                     progress_bar = st.progress(0)
-                    for i, (image_bytes, mime_type) in enumerate(zip(image_bytes_list, mime_types)):
-                        with st.spinner(f"Extracting data from image {i+1}..."):
-                            try:
-                                groq_client = GroqClient(api_key=st.session_state.groq_api_key)
-                                # Dynamic OCR prompt
-                                initial_prompt = """
-                                You are an intelligent OCR extraction agent capable of understanding and processing invoices in {language}.
-                                Extract all relevant information from the provided invoice image in structured JSON format.
-                                The JSON object must follow this schema: {schema}.
-                                Include a confidence score (0.0 to 1.0) for each extracted field in a separate 'confidence_scores' object.
-                                If a field cannot be found, return it as null.
-                                Look for common invoice patterns such as:
-                                - Invoice number: Often labeled as 'Invoice #', 'No.', or similar.
-                                - Dates: Look for 'Date', 'Issued', 'Due', in formats like MM/DD/YYYY or DD/MM/YYYY.
-                                - Addresses: Look for 'Bill to', 'Ship to', or multi-line address blocks.
-                                - Line items: Tables or lists with description, quantity, unit price, and total.
-                                - Totals: Look for 'Subtotal', 'Tax', 'Total', often at the bottom.
-                                - Currency: Look for symbols ($, €, £) or codes (USD, EUR).
-                                IMPORTANT: total_amount must be the literal total figure printed on
-                                the invoice, not a value you compute by adding subtotal and tax
-                                yourself - if the printed total looks inconsistent with subtotal +
-                                tax, still report the printed value verbatim; that inconsistency is
-                                a real finding, not a fix for you to make.
-                                Return the result strictly in JSON format with 'data' and 'confidence_scores' keys.
-                                """
-                                base64_image = base64.b64encode(image_bytes).decode("utf-8")
-                                image_content = {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}
-                                }
-                                initial_data = groq_client.extract_invoice_data(
-                                    initial_prompt.format(
-                                        language=language,
-                                        schema=json.dumps(InvoiceData.model_json_schema(), indent=2)
-                                    ),
-                                    image_content
-                                )
-                                invoice_type = detect_invoice_type(initial_data.get("data", {}))
-                                
-                                type_specific_prompts = {
-                                    "retail": "Focus on product SKUs, quantities, and unit prices in line items.",
-                                    "service": "Emphasize service descriptions, hours worked, and rates in line items.",
-                                    "utility": "Prioritize billing periods, meter readings, and rate structures.",
-                                    "general": "Extract all fields as per the schema."
-                                }
-                                prompt = initial_prompt + f"\nSpecific instructions for {invoice_type} invoices: {type_specific_prompts[invoice_type]}"
-                                
-                                max_retries = 2
-                                for attempt in range(max_retries):
-                                    try:
-                                        extracted_data = groq_client.extract_invoice_data(
-                                            prompt.format(
-                                                language=language,
-                                                schema=json.dumps(InvoiceData.model_json_schema(), indent=2)
-                                            ),
-                                            image_content
-                                        )
-                                        invoice = InvoiceData(**extracted_data.get("data", {}))
-                                        confidence_scores = extracted_data.get("confidence_scores", {})
-                                        
-                                        if all(value is None for value in extracted_data.get("data", {}).values()):
-                                            st.warning(f"Image {i+1}, Attempt {attempt + 1}: No data extracted. Retrying..." if attempt < max_retries - 1 else f"Image {i+1}: All attempts failed.")
-                                            continue
-                                        
-                                        st.session_state.invoices.append({
-                                            "invoice": invoice,
-                                            "confidence_scores": confidence_scores,
-                                            "image_id": str(uuid4()),
-                                            "invoice_type": invoice_type
-                                        })
-                                        display_results(invoice)
-                                        st.subheader("Confidence Scores")
-                                        st.json(confidence_scores)
-                                        st.info(f"Detected Invoice Type: {invoice_type.capitalize()}")
-                                        st.success(f"Image {i+1} processed successfully!")
-                                        break
-                                    
-                                    except Exception as e:
-                                        if attempt < max_retries - 1:
-                                            st.warning(f"Image {i+1}, Attempt {attempt + 1} failed: {str(e)}. Retrying...")
-                                            continue
-                                        display_error(f"Image {i+1}: Failed to parse after {max_retries} attempts: {str(e)}")
-                            
-                            except Exception as e:
-                                display_error(f"Image {i+1}: Failed to parse: {str(e)}. Try a clearer image.")
-                        
-                        progress_bar.progress((i + 1) / len(image_bytes_list))
+                    status_text = st.empty()
+                    n = len(image_bytes_list)
+                    max_workers = min(4, n)  # Groq's per-account concurrency has a ceiling too
+                    completed = 0
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {
+                            executor.submit(
+                                extract_one_invoice, image_bytes, mime_type, language, st.session_state.groq_api_key
+                            ): i
+                            for i, (image_bytes, mime_type) in enumerate(zip(image_bytes_list, mime_types))
+                        }
+                        results = [None] * n
+                        for future in as_completed(futures):
+                            i = futures[future]
+                            results[i] = future.result()
+                            completed += 1
+                            progress_bar.progress(completed / n)
+                            status_text.text(f"Processed {completed}/{n} images...")
+                    status_text.empty()
+
+                    for i, (record, error) in enumerate(results):
+                        if record:
+                            st.session_state.invoices.append(record)
+                            display_results(record["invoice"])
+                            st.subheader("Confidence Scores")
+                            st.json(record["confidence_scores"])
+                            st.info(f"Detected Invoice Type: {record['invoice_type'].capitalize()}")
+                            st.success(f"Image {i+1} processed successfully!")
+                        else:
+                            display_error(f"Image {i+1}: Failed to parse after retries: {error}")
                 
                 # Data editing with validation feedback
                 if st.session_state.invoices:
@@ -518,8 +558,9 @@ def enhanced_ui():
 
     with tab3:
         st.header("Fraud Detection")
+        st.caption("Each invoice below is scored from the checks it actually triggered - duplicate numbers, disproportionate amounts, arithmetic inconsistency, low OCR confidence, statistical outliers, and an image-manipulation heuristic.")
         if st.session_state.invoices:
-            detect_fraud(st.session_state.invoices)
+            render_fraud_detection(st.session_state.invoices)
         else:
             st.info("No invoices processed yet. Upload invoices in the Extraction tab.")
 

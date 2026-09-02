@@ -5,3 +5,4 @@ pymupdf
 scikit-learn
 plotly
 pandas
+Pillow
