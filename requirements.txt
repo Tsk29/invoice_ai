@@ -1,0 +1,7 @@
+groq
+streamlit
+python-dotenv
+pymupdf
+scikit-learn
+plotly
+pandas
