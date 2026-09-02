@@ -1,9 +1,11 @@
 import streamlit as st
 import json
 import base64
+import time
 import pandas as pd
 from utils import InvoiceData, GroqClient, preprocess_image, process_image_upload, process_image_url, display_image_preview, setup_page, show_extraction_button, display_results, display_error, run_chatbot, edit_invoice_data, export_to_csv, is_pdf_file, get_pdf_page_count, render_pdf_page
 from analytics import analyze_invoices, detect_anomalies, score_invoices
+from ocr_hybrid import PADDLEOCR_AVAILABLE
 from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
@@ -171,35 +173,53 @@ a real finding, not a fix for you to make.
 Return the result strictly in JSON format with 'data' and 'confidence_scores' keys.
 """
 
-def extract_one_invoice(image_bytes: bytes, mime_type: str, language: str, api_key: str, max_retries: int = 2):
+def extract_one_invoice(image_bytes: bytes, mime_type: str, language: str, api_key: str,
+                         method: str = "vision", max_retries: int = 2):
     """Run one image through extraction and return (record, error). Runs
     inside a worker thread as part of the batch's concurrent processing, so
     it must never call any st.* function - Streamlit's session context isn't
     available off the main script thread. UI rendering happens afterward,
     back on the main thread, using the record this returns.
 
-    This used to be two full vision-LLM calls per image: one purely to
-    classify the invoice type, then a second, nearly identical call that was
-    the one actually used. The type classification only needs the fields the
-    single call below already extracts (vendor name, line-item descriptions),
-    so the second call was pure overhead - cutting it roughly halves
-    per-image latency.
+    `method` selects the extraction path:
+    - "vision" (default): one vision-LLM call reads the image and returns
+      structured JSON directly. This used to be two calls per image - one
+      purely to classify invoice type, then a second, nearly identical call
+      that was the one actually used - cut to one for ~2x per-image latency.
+    - "paddleocr_hybrid": PaddleOCR reads the raw text locally, then a
+      text-only LLM call (no image tokens) structures it. See
+      ocr_hybrid.py's module docstring and the README's OCR Architecture
+      section for why this is optional rather than the default - it adds a
+      real dependency footprint and wasn't a clear speed win without a GPU.
     """
     groq_client = GroqClient(api_key=api_key)
-    prompt = EXTRACTION_PROMPT_TEMPLATE.format(
-        language=language,
-        schema=json.dumps(InvoiceData.model_json_schema(), indent=2)
-    )
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
-    image_content = {
-        "type": "image_url",
-        "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}
-    }
+    schema = json.dumps(InvoiceData.model_json_schema(), indent=2)
+    timing = {}
+
+    if method == "paddleocr_hybrid":
+        from ocr_hybrid import extract_text_paddleocr, STRUCTURING_PROMPT_TEMPLATE
+        try:
+            raw_text, ocr_elapsed = extract_text_paddleocr(image_bytes, language)
+        except Exception as e:
+            return None, f"PaddleOCR failed: {e}"
+        timing["ocr_seconds"] = round(ocr_elapsed, 2)
+        prompt = STRUCTURING_PROMPT_TEMPLATE.format(language=language, schema=schema, raw_text=raw_text)
+        call = lambda: groq_client.structure_text(prompt)
+    else:
+        prompt = EXTRACTION_PROMPT_TEMPLATE.format(language=language, schema=schema)
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        image_content = {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime_type};base64,{base64_image}"}
+        }
+        call = lambda: groq_client.extract_invoice_data(prompt, image_content)
 
     last_error = "No data extracted"
     for _ in range(max_retries):
         try:
-            extracted_data = groq_client.extract_invoice_data(prompt, image_content)
+            t0 = time.time()
+            extracted_data = call()
+            timing["llm_seconds"] = round(time.time() - t0, 2)
             data = extracted_data.get("data", {})
             if all(value is None for value in data.values()):
                 last_error = "Model returned no data"
@@ -211,6 +231,8 @@ def extract_one_invoice(image_bytes: bytes, mime_type: str, language: str, api_k
                 "image_id": str(uuid4()),
                 "invoice_type": detect_invoice_type(data),
                 "image_bytes": image_bytes,
+                "extraction_method": method,
+                "timing": timing,
             }
             return record, None
         except Exception as e:
@@ -394,6 +416,15 @@ def enhanced_ui():
             
             with col2:
                 st.subheader("Extracted Invoice Data")
+
+                method_options = ["Vision LLM (default)"]
+                if PADDLEOCR_AVAILABLE:
+                    method_options.append("PaddleOCR + Text LLM (experimental)")
+                else:
+                    st.caption("PaddleOCR + Text LLM mode is unavailable - install requirements-ocr.txt to enable it.")
+                method_choice = st.radio("Extraction method", method_options, horizontal=True, key="extraction_method")
+                extraction_method = "paddleocr_hybrid" if "PaddleOCR" in method_choice else "vision"
+
                 if show_extraction_button():
                     progress_bar = st.progress(0)
                     status_text = st.empty()
@@ -403,7 +434,8 @@ def enhanced_ui():
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = {
                             executor.submit(
-                                extract_one_invoice, image_bytes, mime_type, language, st.session_state.groq_api_key
+                                extract_one_invoice, image_bytes, mime_type, language,
+                                st.session_state.groq_api_key, extraction_method
                             ): i
                             for i, (image_bytes, mime_type) in enumerate(zip(image_bytes_list, mime_types))
                         }
@@ -423,6 +455,9 @@ def enhanced_ui():
                             st.subheader("Confidence Scores")
                             st.json(record["confidence_scores"])
                             st.info(f"Detected Invoice Type: {record['invoice_type'].capitalize()}")
+                            timing = record.get("timing") or {}
+                            if timing:
+                                st.caption(f"Timing: {timing}")
                             st.success(f"Image {i+1} processed successfully!")
                         else:
                             display_error(f"Image {i+1}: Failed to parse after retries: {error}")

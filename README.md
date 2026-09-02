@@ -9,7 +9,7 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 ##  Features
 
 - **Multilingual Support**: Parse invoices in English, Spanish, French, German, Tamil, and more
-- **AI-Powered Extraction**: Uses a Groq-hosted vision LLM for structured data extraction from images or PDFs
+- **AI-Powered Extraction**: Uses a Groq-hosted vision LLM for structured data extraction from images or PDFs, with an optional PaddleOCR + text-LLM hybrid path (see [OCR Architecture](#ocr-architecture))
 - **PDF Support**: Upload PDF invoices directly — pages are rasterized and sent through the same extraction pipeline as images
 - **Explainable Fraud Scoring**: Every invoice gets a 0-100 score, a Low/Medium/High risk category, and a plain-language reason for every signal that fired - not just a flag with no explanation
 - **Anomaly Detection**: Real Isolation Forest (scikit-learn) over total/subtotal/tax to flag statistically unusual invoices
@@ -32,10 +32,13 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 ![Pandas](https://img.shields.io/badge/Pandas-150458?logo=pandas)
 ![Plotly](https://img.shields.io/badge/Plotly-3F4F75?logo=plotly)
 
-> **Note on the model**: the extraction model is a config value (`GroqClient`, `utils.py`), not
-> hardcoded to one vendor's release. Groq's catalog of available vision-capable models changes
-> over time — check `GET /openai/v1/models` on your own API key and update the default in
-> `utils.py` if the configured model stops being served.
+> **Note on the model**: this currently runs on `qwen/qwen3.8-27b` (Alibaba's Qwen), not Llama -
+> the project originally targeted Meta's `llama-4-scout` vision model, but Groq stopped serving
+> it, and as of this writing Groq has **no active Llama vision model at all**; Qwen's two
+> vision-capable models are the only ones currently available there. The model is a config
+> value (`GroqClient`, `utils.py`), not hardcoded to one vendor - check `GET /openai/v1/models`
+> on your own API key and update the default in `utils.py` if the configured model stops being
+> served, which is exactly what happened here once already.
 
 
 ### Key Directories Explained:
@@ -76,9 +79,11 @@ accurate, so here's what's actually on screen.)
 invoices, successfully processed, success rate).
 
 **📄 Invoice Extraction** — drag-and-drop upload for one or many images/PDFs at once;
-multi-page PDFs get a page picker. Each file gets a preview thumbnail alongside the raw
-extracted JSON, a per-field confidence-score table, an editable data grid (low-confidence
-cells highlighted), and direct "Download All as CSV / JSON" buttons.
+multi-page PDFs get a page picker. A radio picks the extraction method: the default vision LLM,
+or (if `requirements-ocr.txt` is installed) PaddleOCR + Text LLM - see
+[OCR Architecture](#ocr-architecture). Each file gets a preview thumbnail alongside the raw
+extracted JSON, a per-field confidence-score table, a per-image timing breakdown, an editable
+data grid (low-confidence cells highlighted), and direct "Download All as CSV / JSON" buttons.
 
 **🤖 Chatbot** — a real chat thread (`st.chat_message` bubbles) with four one-click quick
 questions plus free-text input, answering from the currently extracted invoice batch.
@@ -114,9 +119,9 @@ only needs fields the extraction call already returns (vendor name, line-item de
 so the second call was pure overhead. It's now one call per image, and the batch runs
 concurrently (`ThreadPoolExecutor`, capped at 4 workers) instead of one image at a time.
 Measured on a 4-image batch against the same model: ~230s before → ~140s after (~40% faster).
-The remaining time is dominated by the vision model's own per-call latency, not client-side
-inefficiency - see [OCR Architecture](#ocr-architecture-why-not-paddleocr-yet) below for why
-a local-OCR hybrid wasn't the next move.
+The remaining time comes from the vision model's own per-call latency, which - unlike the
+optional PaddleOCR path - varies with Groq's current load rather than being a fixed cost. See
+[OCR Architecture](#ocr-architecture) below for the two paths compared head-to-head.
 
 ### Anomaly Detection with Isolation Forest
 
@@ -176,33 +181,47 @@ miss anything but fairly aggressive edits. A synthetic tamper test (pasting text
 sample invoice) barely moved the score. Treat this as a weak supplementary signal, not a
 manipulation detector.
 
-##  OCR Architecture: why not PaddleOCR (yet)
+##  OCR Architecture
 
-The extraction pipeline sends the whole invoice image straight to a Groq-hosted vision LLM,
-which reads and structures it in one pass — there's no local OCR step today. A local-OCR +
-text-LLM hybrid (PaddleOCR extracts raw text fast and cheaply; a text-only LLM call structures
-it, skipping the much more expensive vision-token processing) is a real, legitimate pattern
-and was evaluated for this repo. It wasn't adopted, for three concrete reasons:
+By default, the extraction pipeline sends the whole invoice image straight to a Groq-hosted
+vision LLM, which reads and structures it in one pass. `ocr_hybrid.py` adds an **optional**
+second path: PaddleOCR reads the raw text locally, then a text-only LLM call (no image tokens)
+structures that text into the same schema. Both are selectable per-batch from a radio in the
+Extraction tab, and the choice is a genuine engineering trade-off, not a strict upgrade in
+either direction - here's what an actual spike found, run against `.Dataset/` samples on a
+CPU-only dev machine (no GPU):
 
-1. **Footprint**: `paddlepaddle` alone is a ~100MB wheel on macOS ARM (~186MB on Linux), plus
-   `paddleocr` and its downloaded recognition/detection models on top — a large jump for an
-   app whose entire dependency list is currently a few hundred KB of pure-Python packages, and
-   a real concern for anyone deploying this on a resource-capped host (e.g. Streamlit
-   Community Cloud).
-2. **Tamil support is uncertain**: this repo's actual multilingual pain point is Tamil (see
-   [Multilingual Support](#multilingual-support)), and PaddleOCR's multilingual recognition
-   quality outside its strongest languages (Chinese, English) wasn't verified against a Tamil
-   sample before deciding — that verification would need to happen before committing to the
-   dependency, not after.
-3. **The measured bottleneck wasn't OCR** — it was calling the vision LLM twice per image (see
-   above). Fixing that (one call instead of two, run concurrently) cut batch time by ~40% with
-   zero new dependencies and zero architecture risk, which is a better cost/benefit trade than
-   a rearchitecture whose main promised benefit is *also* speed.
+| | Vision LLM (default) | PaddleOCR + Text LLM |
+|---|---|---|
+| Per-image latency | Highly variable: as low as ~2s, up to ~30s+, depending on Groq's current load | Predictable: ~9-11s fixed local OCR + ~1-2s text LLM call, independent of API load |
+| Dependencies | None beyond the base app | `paddlepaddle` (~100MB macOS ARM / ~186MB Linux) + `paddleocr` + ~250-400MB of downloaded recognition/detection models |
+| Tamil accuracy (this sample) | Missed `tax` entirely on one run | Correctly extracted every field, 0.9-1.0 OCR confidence on most text regions |
+| Setup | Works out of the box | Needs `requirements-ocr.txt` installed in a **virtual environment** (see below) |
 
-If someone wants to revisit this: the right next step is a spike that runs `paddleocr` against
-the Tamil sample in `.Dataset/` and compares its raw text output to what the vision model
-already extracts, *before* touching the pipeline - the decision should follow evidence on this
-repo's actual documents, not general reputation.
+The vision path's latency swings are a real operational concern for anything time-sensitive -
+"usually fast, occasionally 30s" is a worse SLA than "reliably ~11s." The hybrid path's
+accuracy edge on this Tamil sample lines up with a mechanical reason: PaddleOCR isolates a
+line like `TOTAL` / `Rs.1,370.00` as its own clean text region, which gives the structuring
+LLM less room to reinterpret or recompute it than reading the number off a full table layout.
+
+**To enable PaddleOCR + Text LLM**, install it into a **separate virtual environment** - not
+your system/global Python. Installing it globally during development caused real version
+conflicts with unrelated packages (`langchain`, `tensorflow`, `kubernetes`) on the dev machine
+this was built on:
+
+```bash
+python -m venv .venv-ocr
+source .venv-ocr/bin/activate   # .venv-ocr\Scripts\activate on Windows
+pip install -r requirements.txt -r requirements-ocr.txt
+streamlit run enhanced_ui.py
+```
+
+If `paddleocr` isn't installed, the app detects that at import time and simply hides the
+option in the UI rather than crashing - see `ocr_hybrid.py`'s `PADDLEOCR_AVAILABLE` flag.
+
+This isn't a fully-resolved comparison — one Tamil sample and a handful of timed runs is a
+spike, not a benchmark. See [Future Enhancements](#future-enhancements) for turning this into
+one.
 
 ##  Installation
 
@@ -216,6 +235,9 @@ repo's actual documents, not general reputation.
    ```bash
    pip install -r requirements.txt
    ```
+   Optionally, to enable the PaddleOCR + Text LLM extraction mode, install
+   `requirements-ocr.txt` **into a separate virtual environment** - see
+   [OCR Architecture](#ocr-architecture) for why that isolation matters.
 
 3. Set up your Groq API key (get one at [console.groq.com](https://console.groq.com)) using **either**:
    - a `.streamlit/secrets.toml` file:
@@ -286,9 +308,11 @@ against the source document.
       reload; add a SQLite/Postgres store so extracted history survives across sessions
 - [ ] **Multi-page PDF extraction** — currently one page per PDF is extracted; merge line
       items across all pages of a multi-page invoice
-- [ ] **PaddleOCR spike** — run it against the Tamil samples in `.Dataset/` and compare
-      against the vision model's own output before deciding whether to adopt it (see
-      [OCR Architecture](#ocr-architecture-why-not-paddleocr-yet))
+- [ ] **Proper OCR-path benchmark** — the [OCR Architecture](#ocr-architecture) comparison is
+      a spike (one Tamil sample, a handful of timed runs), not a benchmark; running both paths
+      across all of `.Dataset/` with repeated trials would turn "here's what I observed" into
+      real numbers with variance, and is the natural next step for whoever wants to trust the
+      comparison table there
 - [ ] **Fraud score calibration** — the signal weights and ELA threshold are hand-set
       heuristics; calibrating them against real labeled fraud examples (if any become
       available) would make the score meaningfully more trustworthy

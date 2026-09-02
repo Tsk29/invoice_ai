@@ -92,7 +92,28 @@ class GroqClient:
         )
         
         return json.loads(response.choices[0].message.content)
-    
+
+    def structure_text(self, prompt, model="qwen/qwen3.8-27b"):
+        """Text-only structuring call (no image) - used by the PaddleOCR
+        hybrid path in ocr_hybrid.py to turn raw OCR text into the
+        InvoiceData JSON schema. No image tokens means this is meaningfully
+        cheaper and faster per call than extract_invoice_data."""
+        messages = [{
+            "role": "user",
+            "content": prompt
+        }]
+
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.2,
+            max_completion_tokens=1024,
+            stream=False,
+            response_format={"type": "json_object"},
+        )
+
+        return json.loads(response.choices[0].message.content)
+
     def run_chatbot_query(self, prompt, model="qwen/qwen3.8-27b"):
         """Handle text-only chatbot queries."""
         messages = [{
