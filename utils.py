@@ -227,7 +227,23 @@ def show_extraction_button():
 
 def display_results(invoice_data):
     st.success("✅ Data extracted successfully!")
-    st.json(invoice_data.dict())
+    data = invoice_data.dict()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Invoice #", data.get("invoice_number") or "—")
+    col2.metric("Vendor", data.get("vendor_name") or "—")
+    total = data.get("total_amount")
+    currency = data.get("currency") or ""
+    col3.metric("Total", f"{total:,.2f} {currency}".strip() if total is not None else "—")
+    col4.metric("Date", data.get("invoice_date") or "—")
+
+    line_items = data.get("line_items") or []
+    if line_items:
+        st.caption("Line items")
+        st.dataframe(pd.DataFrame(line_items), use_container_width=True, hide_index=True)
+
+    with st.expander("Full extracted data (JSON)"):
+        st.json(data)
 
 def display_error(message):
     st.error(f"❌ {message}")

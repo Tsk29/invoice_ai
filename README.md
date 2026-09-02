@@ -75,18 +75,26 @@ anomaly detection, and interactive data visualization — built on Groq's vision
 accurate, so here's what's actually on screen.)
 
 **Sidebar** — invoice language picker (English, Spanish, French, German, Tamil, Other), a
-🌙 dark-mode toggle that re-themes the whole page, and a live batch status readout (total
-invoices, successfully processed, success rate).
+🌙 dark-mode toggle that re-themes the whole page, live batch status as metric tiles (total,
+processed, success rate), and a "Clear all invoices" button that resets the session (invoices
+and chat history) once there's something to clear.
 
 **📄 Invoice Extraction** — drag-and-drop upload for one or many images/PDFs at once;
 multi-page PDFs get a page picker. A radio picks the extraction method: the default vision LLM,
 or (if `requirements-ocr.txt` is installed) PaddleOCR + Text LLM - see
-[OCR Architecture](#ocr-architecture). Each file gets a preview thumbnail alongside the raw
-extracted JSON, a per-field confidence-score table, a per-image timing breakdown, an editable
-data grid (low-confidence cells highlighted), and direct "Download All as CSV / JSON" buttons.
+[OCR Architecture](#ocr-architecture). Each processed image renders as a bordered card: a
+metric row (invoice #, vendor, total, date), a line-items table, per-image type/confidence/
+timing captions, a collapsible raw-confidence-scores view, and a collapsible full-JSON view for
+anyone who wants the unformatted data - plus direct "Download All as CSV / JSON" buttons and an
+editable data grid (low-confidence cells highlighted) for the whole batch.
 
 **🤖 Chatbot** — a real chat thread (`st.chat_message` bubbles) with four one-click quick
-questions plus free-text input, answering from the currently extracted invoice batch.
+questions plus free-text input, answering from the currently extracted invoice batch (capped at
+the 15 most recent invoices per question, so a large batch doesn't blow up prompt size - the
+model is told explicitly when it's only seeing a subset). Both the quick-question buttons and
+the input are disabled with an explanatory message until at least one invoice exists, so asking
+a question never fires against empty context. A "Clear chat" button appears once there's a
+conversation to clear.
 
 **🚨 Fraud Detection** — one expandable card per invoice: extracted fields, a 0-100 risk
 score with a progress bar, a Low/Medium/High category, and the specific reasons behind the
@@ -210,6 +218,41 @@ reason: PaddleOCR isolates a line like `TOTAL` / `Rs.1,370.00` as its own clean 
 giving the structuring LLM less room to reinterpret or recompute it than reading the number off
 a full table layout in an image. Worth reaching for on a non-Latin-script invoice you don't
 trust the default extraction on - not a general replacement.
+
+### How the hybrid path works, step by step
+
+1. The extraction-method radio in the UI passes `method="paddleocr_hybrid"` into
+   `extract_one_invoice()` (`enhanced_ui.py`).
+2. `ocr_hybrid.extract_text_paddleocr()` writes the image bytes to a temp file - PaddleOCR's
+   `predict()` only accepts a file path, not bytes - and runs PaddleOCR's own detection →
+   recognition pipeline on it, returning a flat string of recognized text lines.
+3. That text (never the image) is substituted into `STRUCTURING_PROMPT_TEMPLATE` and sent via
+   `GroqClient.structure_text()` - a plain-string chat message with no `image_url` content
+   block, which is why it's cheaper and faster per call than the vision path.
+4. The response is parsed into the same `InvoiceData` schema and merged into the same record
+   shape (`image_id`, `confidence_scores`, `invoice_type`, timing) as the vision path, so
+   everything downstream - fraud scoring, analytics, export - treats both paths identically.
+5. If `paddleocr` isn't installed, `ocr_hybrid.py`'s import is wrapped in try/except and sets
+   `PADDLEOCR_AVAILABLE = False`; the UI checks that flag and simply doesn't render the option.
+
+### Pros and cons
+
+**PaddleOCR + Text LLM**
+- ✅ Caught a `tax` field the vision model missed on the Tamil sample (small-sample signal, not proven)
+- ✅ Text-only LLM call is cheaper per token than a vision call (no image tokens)
+- ✅ Fully local OCR step - no image data leaves the machine until the (much smaller) text payload is sent
+- ❌ 5-9x slower end-to-end on both samples tested here
+- ❌ ~350-600MB of dependencies (paddlepaddle + paddleocr + downloaded models), needs its own virtual environment
+- ❌ Loses layout/table structure - OCR returns a flat list of text lines, so the structuring LLM has to reconstruct line-item tables from text alone instead of "seeing" the table
+- ❌ No GPU on the dev machine this was tested on - OCR latency would likely drop substantially with one, but that's unverified here
+
+**Vision LLM (default)**
+- ✅ 5-9x faster per call in both languages tested
+- ✅ Sees the actual layout/table structure directly - no OCR-order-of-lines problem
+- ✅ Zero extra dependencies, works out of the box
+- ❌ Missed a field on the one non-Latin-script sample tested (Tamil `tax`)
+- ❌ Latency varies under concurrent batch load (Groq queuing/rate limits), not just per-call time
+- ❌ Sends the full image to a third-party API on every call
 
 **To enable PaddleOCR + Text LLM**, install it into a **separate virtual environment** - not
 your system/global Python. Installing it globally during development caused real version

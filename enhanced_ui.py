@@ -287,9 +287,16 @@ def display_batch_status(invoices):
     total = len(invoices)
     successful = sum(1 for inv in invoices if inv["invoice"].invoice_number is not None)
     st.sidebar.subheader("Batch Processing Status")
-    st.sidebar.write(f"Total Invoices: {total}")
-    st.sidebar.write(f"Successfully Processed: {successful}")
-    st.sidebar.write(f"Success Rate: {successful / total * 100:.1f}%" if total > 0 else "Success Rate: 0%")
+    col1, col2 = st.sidebar.columns(2)
+    col1.metric("Total", total)
+    col2.metric("Processed", successful)
+    st.sidebar.metric("Success Rate", f"{successful / total * 100:.1f}%" if total > 0 else "—")
+    if total > 0:
+        st.sidebar.button(
+            "Clear all invoices",
+            on_click=lambda: st.session_state.update(invoices=[], chat_history=[]),
+            use_container_width=True,
+        )
 
 def select_input_method():
     """Custom input method selection."""
@@ -451,13 +458,18 @@ def enhanced_ui():
                     for i, (record, error) in enumerate(results):
                         if record:
                             st.session_state.invoices.append(record)
-                            display_results(record["invoice"])
-                            st.subheader("Confidence Scores")
-                            st.json(record["confidence_scores"])
-                            st.info(f"Detected Invoice Type: {record['invoice_type'].capitalize()}")
-                            timing = record.get("timing") or {}
-                            if timing:
-                                st.caption(f"Timing: {timing}")
+                            with st.container(border=True):
+                                st.markdown(f"**Image {i+1}**")
+                                display_results(record["invoice"])
+                                numeric_confidences = [v for v in record["confidence_scores"].values() if isinstance(v, (int, float))]
+                                avg_conf = sum(numeric_confidences) / len(numeric_confidences) if numeric_confidences else None
+                                meta_cols = st.columns(3)
+                                meta_cols[0].caption(f"Type: {record['invoice_type'].capitalize()}")
+                                meta_cols[1].caption(f"Avg. confidence: {avg_conf:.0%}" if avg_conf is not None else "Avg. confidence: n/a")
+                                timing = record.get("timing") or {}
+                                meta_cols[2].caption(f"Timing: {timing}" if timing else "")
+                                with st.expander("Confidence scores (raw)"):
+                                    st.json(record["confidence_scores"])
                             st.success(f"Image {i+1} processed successfully!")
                         else:
                             display_error(f"Image {i+1}: Failed to parse after retries: {error}")
@@ -538,9 +550,15 @@ def enhanced_ui():
                     )
 
     with tab2:
-        st.header("Invoice Assistant Chatbot")
+        header_col, clear_col = st.columns([5, 1])
+        header_col.header("Invoice Assistant Chatbot")
+        if st.session_state.chat_history:
+            clear_col.button(
+                "Clear chat", on_click=lambda: st.session_state.update(chat_history=[]), use_container_width=True
+            )
 
-        if not st.session_state.invoices:
+        has_invoices = bool(st.session_state.invoices)
+        if not has_invoices:
             st.info("Process at least one invoice in the Extraction tab to give the assistant something to answer questions about.")
 
         # Replay the conversation as a real chat thread.
@@ -560,7 +578,7 @@ def enhanced_ui():
         quick_cols = st.columns(len(predefined_prompts))
         queued_prompt = None
         for col, quick_prompt in zip(quick_cols, predefined_prompts):
-            if col.button(quick_prompt, key=f"quick_{quick_prompt}", use_container_width=True):
+            if col.button(quick_prompt, key=f"quick_{quick_prompt}", use_container_width=True, disabled=not has_invoices):
                 queued_prompt = quick_prompt
 
         # st.chat_input clears itself after submission and st.button only
@@ -568,14 +586,26 @@ def enhanced_ui():
         # same question on unrelated reruns - unlike the old st.text_input +
         # st.selectbox pattern, which kept re-answering the last question on
         # every rerun anywhere else in the app.
-        typed_prompt = st.chat_input("Ask a question about your invoices...")
+        typed_prompt = st.chat_input("Ask a question about your invoices...", disabled=not has_invoices)
         prompt = queued_prompt or typed_prompt
 
-        if prompt:
-            invoice_context = json.dumps([inv["invoice"].dict() for inv in st.session_state.invoices], indent=2)
+        if prompt and has_invoices:
+            # Cap how many invoices go into the prompt so a large batch
+            # doesn't blow up token usage/latency on every question - the
+            # model is told explicitly when it's only seeing a subset so it
+            # doesn't imply completeness it doesn't have.
+            MAX_CONTEXT_INVOICES = 15
+            all_invoices = st.session_state.invoices
+            context_invoices = all_invoices[-MAX_CONTEXT_INVOICES:]
+            truncated_note = (
+                f"\nNote: only the {MAX_CONTEXT_INVOICES} most recently processed invoices "
+                f"(of {len(all_invoices)} total) are included below.\n"
+                if len(all_invoices) > MAX_CONTEXT_INVOICES else ""
+            )
+            invoice_context = json.dumps([inv["invoice"].dict() for inv in context_invoices], indent=2)
             full_prompt = f"""
             You are an invoice processing assistant. Use the following invoice data as context:
-            {invoice_context}
+            {truncated_note}{invoice_context}
             Answer the user's question: {prompt}
             Provide a concise, accurate response. If the question is unrelated to invoices, politely redirect to invoice-related queries.
             """
