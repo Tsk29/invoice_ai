@@ -387,8 +387,8 @@ against the source document.
 - [ ] **Fraud score calibration** — the signal weights and ELA threshold are hand-set
       heuristics; calibrating them against real labeled fraud examples (if any become
       available) would make the score meaningfully more trustworthy
-- [ ] Additional fraud rules: round-amount detection, after-hours invoice dates,
-      rapid-succession invoices from the same vendor
+- [ ] Additional fraud rules: after-hours invoice dates, rapid-succession invoices from the
+      same vendor (round-amount detection is implemented - see [Fraud Scoring](#fraud-scoring))
 - [ ] Vendor reputation scoring system
 - [ ] Approval workflow / status tracking (pending → approved → paid)
 - [ ] Multi-currency conversion and rollup reporting
