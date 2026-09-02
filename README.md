@@ -193,16 +193,23 @@ CPU-only dev machine (no GPU):
 
 | | Vision LLM (default) | PaddleOCR + Text LLM |
 |---|---|---|
-| Per-image latency | Highly variable: as low as ~2s, up to ~30s+, depending on Groq's current load | Predictable: ~9-11s fixed local OCR + ~1-2s text LLM call, independent of API load |
+| Single-call latency, English invoice (7 line items) | ~2.7s | ~24.4s (~22s OCR + ~2.4s LLM) |
+| Single-call latency, Tamil invoice (3 line items) | ~2.0s | ~11.8s (~10s OCR + ~1.7s LLM) |
+| Accuracy, English invoice | Correct - matched hybrid exactly | Correct |
+| Accuracy, Tamil invoice | Missed `tax` entirely on this run | Correct, including `tax` |
 | Dependencies | None beyond the base app | `paddlepaddle` (~100MB macOS ARM / ~186MB Linux) + `paddleocr` + ~250-400MB of downloaded recognition/detection models |
-| Tamil accuracy (this sample) | Missed `tax` entirely on one run | Correctly extracted every field, 0.9-1.0 OCR confidence on most text regions |
 | Setup | Works out of the box | Needs `requirements-ocr.txt` installed in a **virtual environment** (see below) |
 
-The vision path's latency swings are a real operational concern for anything time-sensitive -
-"usually fast, occasionally 30s" is a worse SLA than "reliably ~11s." The hybrid path's
-accuracy edge on this Tamil sample lines up with a mechanical reason: PaddleOCR isolates a
-line like `TOTAL` / `Rs.1,370.00` as its own clean text region, which gives the structuring
-LLM less room to reinterpret or recompute it than reading the number off a full table layout.
+**Verdict**: Vision LLM is the better default. On a single call it was consistently 5-9x faster
+than the hybrid path in both languages tested, and matched it exactly on the English sample.
+Earlier notes here claimed vision latency "swings wildly, 2s-30s+" - that variability shows up
+under concurrent *batch* load (multiple images submitted together, likely Groq queuing/rate
+limits), not on a single image, which was fast and consistent in both runs above. The one place
+the hybrid path earned its cost was Tamil `tax` extraction, which lines up with a mechanical
+reason: PaddleOCR isolates a line like `TOTAL` / `Rs.1,370.00` as its own clean text region,
+giving the structuring LLM less room to reinterpret or recompute it than reading the number off
+a full table layout in an image. Worth reaching for on a non-Latin-script invoice you don't
+trust the default extraction on - not a general replacement.
 
 **To enable PaddleOCR + Text LLM**, install it into a **separate virtual environment** - not
 your system/global Python. Installing it globally during development caused real version
@@ -219,9 +226,9 @@ streamlit run enhanced_ui.py
 If `paddleocr` isn't installed, the app detects that at import time and simply hides the
 option in the UI rather than crashing - see `ocr_hybrid.py`'s `PADDLEOCR_AVAILABLE` flag.
 
-This isn't a fully-resolved comparison — one Tamil sample and a handful of timed runs is a
-spike, not a benchmark. See [Future Enhancements](#future-enhancements) for turning this into
-one.
+This isn't a fully-resolved comparison — two samples (one Tamil, one English) and a handful of
+timed runs is a spike, not a benchmark. See [Future Enhancements](#future-enhancements) for
+turning this into one.
 
 ##  Installation
 
