@@ -120,6 +120,10 @@ def main():
                         - Line items: Tables or lists with description, quantity, unit price, and total.
                         - Totals: Look for 'Subtotal', 'Tax', 'Total', often at the bottom.
                         - Currency: Look for symbols ($, €, £) or codes (USD, EUR).
+                        IMPORTANT: total_amount must be the literal total figure printed on the
+                        invoice, not a value you compute by adding subtotal and tax yourself - if
+                        the printed total looks inconsistent with subtotal + tax, still report the
+                        printed value verbatim; that inconsistency is a real finding, not a fix for you to make.
                         Return the result strictly in JSON format with 'data' and 'confidence_scores' keys.
                         Example:
                         {{

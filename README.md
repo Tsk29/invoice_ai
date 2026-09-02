@@ -63,13 +63,37 @@ anomaly detection, and interactive data visualization — built on Groq's vision
    - `app.py`: Main processing pipeline
    - `enhanced_ui.py`: Interactive dashboard components
 
+##  Interface Tour
+
+`enhanced_ui.py` is the primary app — a single-page dashboard with a sidebar and four tabs.
+(There's no hosted screenshot here; the UI changes too often for a static image to stay
+accurate, so here's what's actually on screen.)
+
+**Sidebar** — invoice language picker (English, Spanish, French, German, Tamil, Other), a
+🌙 dark-mode toggle that re-themes the whole page, and a live batch status readout (total
+invoices, successfully processed, success rate).
+
+**📄 Invoice Extraction** — drag-and-drop upload for one or many images/PDFs at once;
+multi-page PDFs get a page picker. Each file gets a preview thumbnail alongside the raw
+extracted JSON, a per-field confidence-score table, an editable data grid (low-confidence
+cells highlighted), and direct "Download All as CSV / JSON" buttons.
+
+**🤖 Chatbot** — a real chat thread (`st.chat_message` bubbles) with four one-click quick
+questions plus free-text input, answering from the currently extracted invoice batch.
+
+**🚨 Fraud Detection** — a table of invoices flagged by the rule-based checks below.
+
+**📊 Analytics** — Plotly charts (total-amount distribution, tax vs. subtotal, currency
+breakdown) plus the Isolation Forest anomaly table.
+
+`app.py` is a second, lightweight entry point: single-invoice upload, extraction, inline
+editing, CSV/JSON export, and a basic chat box — no tabs, no batch processing.
+
 ##  How It Works
 
-### 1. Intelligent Invoice Parsing Pipeline
+### Extraction Pipeline
 
-![image](https://github.com/user-attachments/assets/2b213cc7-2ecc-403c-a979-d72e846aefbc)
-
-Our system follows a sophisticated multi-stage process:
+The extraction flow (used by both apps) is:
 
 1. **PDF Rasterization**: PDF uploads are rendered page-by-page to images (PyMuPDF) before extraction
 2. **Image Preprocessing**: Enhances contrast and resizes images for optimal OCR accuracy
@@ -78,7 +102,7 @@ Our system follows a sophisticated multi-stage process:
 5. **Confidence Scoring**: Provides confidence levels for each extracted field
 6. **Validation**: Cross-checks calculated totals against extracted values
 
-### 2. Anomaly Detection with Isolation Forest
+### Anomaly Detection with Isolation Forest
 
 `analytics.py` runs a real scikit-learn Isolation Forest over each batch's numeric fields
 (`total_amount`, `subtotal`, `tax`), surfaced in the **Analytics** tab of the dashboard
@@ -105,7 +129,7 @@ Key advantages:
 - Identifies both global and local outliers
 - Computationally efficient
 
-### 3. Fraud Detection System
+### Fraud Detection System
 
 `detect_fraud()` (`enhanced_ui.py`) applies rule-based checks per batch:
 
@@ -115,14 +139,6 @@ Key advantages:
 
 This runs independently from the Isolation Forest anomaly detection in the **Analytics**
 tab — fraud rules are deterministic thresholds, anomaly detection is statistical.
-
-##  UI Showcase
-
-| Feature | Screenshot |
-|---------|------------|
-| **Main Interface** | ![image](https://github.com/user-attachments/assets/2e8c9582-ff0c-4790-817f-95298c7d43f2)|
-| **Fraud Detection** |![Screenshot 2025-06-03 231430](https://github.com/user-attachments/assets/c9531a28-631a-46b8-9574-ae2e7d02c00f)|
-| **Chat Assistant** |![image](https://github.com/user-attachments/assets/11de9800-101e-4099-bf3c-b81815efbc83)|
 
 ##  Installation
 
@@ -187,12 +203,18 @@ yet — see [Future Enhancements](#-future-enhancements).
 
 ##  Multilingual Support
 
-The application seamlessly handles invoices in multiple languages:
+The language picker tells the vision model what language to expect on the invoice; it does
+**not** translate the extracted fields — vendor names, line-item descriptions, etc. come back
+in their original script (e.g. Tamil text stays Tamil, not transliterated or translated to
+English). This is extraction-in-context, not a translation feature.
 
-| Language | Sample Output |
-|----------|---------------|
-| Tamil | ![image](https://github.com/user-attachments/assets/90c73647-7f96-4605-98c1-60cf98fb1a3f)|
-| French | ![image](https://github.com/user-attachments/assets/805aafeb-2d7b-4766-bb5a-c02f20c55db8)|
+Extraction accuracy on non-Latin scripts (Tamil, Arabic) depends on the underlying vision
+model and tends to be lower than on Latin-script invoices, especially for numeric fields the
+model might try to compute rather than read verbatim — the extraction prompt explicitly
+instructs the model to report the total exactly as printed rather than recalculating it from
+subtotal + tax, which fixed a real mismatch we hit on a sample Tamil invoice, but this remains
+an LLM accuracy limitation, not a solved problem. Always spot-check extracted numeric fields
+against the source document.
 
 ##  Fraud Detection Rules
 

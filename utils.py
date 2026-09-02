@@ -195,6 +195,7 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 def setup_page():
     st.set_page_config(page_title="Invoice AI", page_icon="🧾", layout="wide")
     st.title("🧾 Invoice AI")
+    st.caption("Extract, verify, and analyze invoices with a vision LLM — images or PDFs, one or many at a time.")
 
 def select_input_method():
     return st.radio("Select input method: 📸", 

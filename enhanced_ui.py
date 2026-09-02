@@ -31,6 +31,18 @@ def build_theme_css(theme: str) -> str:
         .stApp, .stApp p, .stApp span, .stApp label, .stMarkdown, h1, h2, h3, h4 {{
             color: {text} !important;
         }}
+        .block-container {{
+            max-width: 1200px;
+            padding-top: 2rem;
+        }}
+        h1 {{
+            font-weight: 800 !important;
+            letter-spacing: -0.02em;
+        }}
+        h2, h3 {{
+            font-weight: 700 !important;
+            margin-top: 1.5rem !important;
+        }}
         .stCaption, [data-testid="stCaptionContainer"] {{
             color: {muted} !important;
         }}
@@ -69,6 +81,12 @@ def build_theme_css(theme: str) -> str:
         [data-testid="stSidebar"] * {{
             color: {text} !important;
         }}
+        [data-testid="stSidebar"] .block-container {{
+            padding-top: 2rem;
+        }}
+        .stTabs [data-baseweb="tab-list"] {{
+            gap: 4px;
+        }}
         .stTabs [data-baseweb="tab"] {{
             border-radius: 8px 8px 0 0;
             padding: 10px 16px;
@@ -77,6 +95,11 @@ def build_theme_css(theme: str) -> str:
         .stTabs [aria-selected="true"] {{
             background-color: {accent}22;
             border-bottom: 2px solid {accent};
+        }}
+        [data-testid="stChatMessage"] {{
+            background-color: {surface};
+            border: 1px solid {border};
+            border-radius: 12px;
         }}
         .low-confidence {{
             background-color: rgba(255, 99, 132, 0.2);
@@ -294,6 +317,11 @@ def enhanced_ui():
                                 - Line items: Tables or lists with description, quantity, unit price, and total.
                                 - Totals: Look for 'Subtotal', 'Tax', 'Total', often at the bottom.
                                 - Currency: Look for symbols ($, €, £) or codes (USD, EUR).
+                                IMPORTANT: total_amount must be the literal total figure printed on
+                                the invoice, not a value you compute by adding subtotal and tax
+                                yourself - if the printed total looks inconsistent with subtotal +
+                                tax, still report the printed value verbatim; that inconsistency is
+                                a real finding, not a fix for you to make.
                                 Return the result strictly in JSON format with 'data' and 'confidence_scores' keys.
                                 """
                                 base64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -436,40 +464,57 @@ def enhanced_ui():
 
     with tab2:
         st.header("Invoice Assistant Chatbot")
-        with st.container():
-            predefined_prompts = [
-                "Summarize the latest invoice",
-                "Check for missing fields in invoices",
-                "List all vendors",
-                "What is the total amount of all invoices?"
-            ]
-            selected_prompt = st.selectbox("Quick Questions", [""] + predefined_prompts, key="predefined_prompt")
-            
+
+        if not st.session_state.invoices:
+            st.info("Process at least one invoice in the Extraction tab to give the assistant something to answer questions about.")
+
+        # Replay the conversation as a real chat thread.
+        for chat in st.session_state.chat_history:
+            with st.chat_message("user"):
+                st.markdown(chat["user"])
+            with st.chat_message("assistant"):
+                st.markdown(chat["bot"])
+
+        predefined_prompts = [
+            "Summarize the latest invoice",
+            "Check for missing fields in invoices",
+            "List all vendors",
+            "What is the total amount of all invoices?"
+        ]
+        st.caption("Quick questions")
+        quick_cols = st.columns(len(predefined_prompts))
+        queued_prompt = None
+        for col, quick_prompt in zip(quick_cols, predefined_prompts):
+            if col.button(quick_prompt, key=f"quick_{quick_prompt}", use_container_width=True):
+                queued_prompt = quick_prompt
+
+        # st.chat_input clears itself after submission and st.button only
+        # returns True on the run it was clicked, so neither re-fires the
+        # same question on unrelated reruns - unlike the old st.text_input +
+        # st.selectbox pattern, which kept re-answering the last question on
+        # every rerun anywhere else in the app.
+        typed_prompt = st.chat_input("Ask a question about your invoices...")
+        prompt = queued_prompt or typed_prompt
+
+        if prompt:
             invoice_context = json.dumps([inv["invoice"].dict() for inv in st.session_state.invoices], indent=2)
-            user_input = st.text_input("Ask a question about your invoices:", key="chat_input")
-            
-            if user_input or selected_prompt:
-                prompt = selected_prompt or user_input
-                full_prompt = f"""
-                You are an invoice processing assistant. Use the following invoice data as context:
-                {invoice_context}
-                Answer the user's question: {prompt}
-                Provide a concise, accurate response. If the question is unrelated to invoices, politely redirect to invoice-related queries.
-                """
-                try:
-                    groq_client = GroqClient(api_key=st.session_state.groq_api_key)
+            full_prompt = f"""
+            You are an invoice processing assistant. Use the following invoice data as context:
+            {invoice_context}
+            Answer the user's question: {prompt}
+            Provide a concise, accurate response. If the question is unrelated to invoices, politely redirect to invoice-related queries.
+            """
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            try:
+                groq_client = GroqClient(api_key=st.session_state.groq_api_key)
+                with st.spinner("Thinking..."):
                     response = groq_client.run_chatbot_query(full_prompt)
-                    st.session_state.chat_history.append({"user": prompt, "bot": response})
-                    st.markdown("**Response:**")
+                with st.chat_message("assistant"):
                     st.markdown(response)
-                except Exception as e:
-                    st.error(f"Chatbot error: {str(e)}. Please try again.")
-            
-            st.sidebar.subheader("Chat History")
-            for i, chat in enumerate(st.session_state.chat_history):
-                with st.sidebar.expander(f"Chat {i+1}"):
-                    st.write(f"**You:** {chat['user']}")
-                    st.write(f"**Bot:** {chat['bot']}")
+                st.session_state.chat_history.append({"user": prompt, "bot": response})
+            except Exception as e:
+                st.error(f"Chatbot error: {str(e)}. Please try again.")
 
     with tab3:
         st.header("Fraud Detection")
