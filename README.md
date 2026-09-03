@@ -68,6 +68,45 @@ anomaly detection, and interactive data visualization — built on Groq's vision
    - `app.py`: Lightweight single-invoice processing pipeline
    - `enhanced_ui.py`: Full dashboard - batch extraction, chatbot, fraud detection, analytics
 
+##  Architecture
+
+```mermaid
+flowchart TD
+    subgraph UI["Streamlit UI"]
+        Enhanced["enhanced_ui.py\nBatch dashboard: 4 tabs"]
+        Simple["app.py\nSingle-invoice entry point"]
+    end
+
+    subgraph Extraction["Extraction pipeline"]
+        PDF["PyMuPDF\nPDF -> page images"]
+        Pre["Preprocessing\ncontrast / resize"]
+        Method{{"Extraction method"}}
+        Vision["Groq Vision LLM\nsingle-pass structured extraction"]
+        OCR["PaddleOCR\nlocal text detection"]
+        Structure["Groq Text LLM\nstructures OCR text"]
+    end
+
+    subgraph Analysis["Analysis — analytics.py"]
+        Fraud["score_invoices()\nrule-based 0-100 fraud score"]
+        Anomaly["Isolation Forest\ntotal/subtotal/tax outliers"]
+        ELA["Error Level Analysis\nimage-manipulation heuristic"]
+    end
+
+    Chat["Chat assistant\nQ&A over extracted batch"]
+
+    Enhanced --> PDF
+    Simple --> PDF
+    PDF --> Pre --> Method
+    Method -->|default| Vision
+    Method -->|optional, requirements-ocr.txt| OCR --> Structure
+    Vision --> Fraud
+    Structure --> Fraud
+    Fraud --> Anomaly
+    Fraud --> ELA
+    Fraud --> Enhanced
+    Enhanced --> Chat
+```
+
 ##  Interface Tour
 
 `enhanced_ui.py` is the primary app — a single-page dashboard with a sidebar and four tabs.
@@ -160,6 +199,26 @@ The extraction flow (used by both apps) is:
    from the same extraction call's result, not a separate model call
 5. **Confidence Scoring**: Provides confidence levels for each extracted field
 6. **Validation**: Cross-checks calculated totals against extracted values
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant UI as enhanced_ui.py
+    participant Pipe as Extraction pipeline
+    participant Vis as Groq Vision LLM
+    participant AF as analytics.py
+
+    U->>UI: Upload invoice image(s)/PDF(s)
+    UI->>Pipe: extract_one_invoice() per image (ThreadPoolExecutor, 4 workers)
+    Pipe->>Pipe: PDF -> images (PyMuPDF), preprocess
+    Pipe->>Vis: Send image, one call per invoice
+    Vis-->>Pipe: Structured fields + type + confidence
+    Pipe-->>UI: InvoiceData records
+    UI->>AF: score_invoices(batch)
+    AF->>AF: Isolation Forest + ELA + rule checks
+    AF-->>UI: risk_score, risk_level, reasons[]
+    UI-->>U: Metric tiles, line-items table, risk card, charts
+```
 
 **Batch extraction speed**: `enhanced_ui.py`'s batch uploader used to make *two* full vision-LLM
 calls per image - one solely to classify invoice type (discarding everything except that
